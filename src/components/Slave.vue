@@ -8,9 +8,9 @@
             <span class="status-dot"></span>
             服务器: {{ signalingStatus }}
           </span>
-          <span class="status-badge" :class="{ connected: driverStatus.includes('Connected') }">
+          <span class="status-badge" :class="{ connected: robotWsStatus === '已连接' }">
             <span class="status-dot"></span>
-            驱动
+            机器人: {{ robotWsStatus }}
           </span>
         </div>
       </div>
@@ -21,6 +21,24 @@
         <button class="primary full-width" @click="connectServer" :disabled="signalingStatus === '已连接'">
           {{ signalingStatus === '已连接' ? '服务器已连接' : '连接服务器' }}
         </button>
+      </div>
+
+      <div class="form-group">
+        <label>机器人串口</label>
+        <select v-model="selectedDeviceId" :disabled="isRobotBusy || robotConnected" style="width: 100%; padding: 0.8rem; margin-bottom: 0.75rem; border-radius: 12px; border: 1px solid rgba(0,0,0,0.1);">
+          <option value="" disabled>请选择串口</option>
+          <option v-for="d in robotDevices" :key="d.device_id + '_' + d.driver_type" :value="d.device_id">
+            {{ d.device_id }}（{{ d.driver_type }}）
+          </option>
+        </select>
+        <div style="display:flex; gap: 12px;">
+          <button class="full-width" @click="fetchRobotInfos" :disabled="isRobotBusy || robotConnected">
+            刷新设备
+          </button>
+          <button class="primary full-width" @click="connectRobot" :disabled="isRobotBusy || robotConnected || !selectedDeviceId || !selectedDriverType">
+            {{ robotConnected ? '已连接' : '连接机器人' }}
+          </button>
+        </div>
       </div>
 
       <div class="form-group">
@@ -60,7 +78,7 @@
 </template>
 
 <script setup>
-import { ref, onMounted, onUnmounted } from 'vue';
+import { ref, onMounted, onUnmounted, computed } from 'vue';
 import { WebRTCManager } from '../utils/webrtc';
 
 const deviceId = ref('robot_01');
@@ -68,15 +86,28 @@ const selectedDeviceIds = ref([]);
 const videoDevices = ref([]);
 const status = ref('未连接');
 const signalingStatus = ref('未连接');
-const driverStatus = ref('未连接');
 const incomingCall = ref(false);
 const incomingCallSender = ref('');
 const isCallActive = ref(false);
 const localVideo = ref(null);
 
 let webrtc = null;
-let driverWs = null;
+let robotWs = null;
 let pendingOffer = null;
+
+const API_BASE = 'http://127.0.0.1:8000';
+const WS_BASE = 'ws://127.0.0.1:8000';
+
+const robotDevices = ref([]); // [{ device_id, driver_type, ... }]
+const selectedDeviceId = ref('');
+const robotWsStatus = ref('未连接');
+const robotConnected = ref(false);
+const isRobotBusy = ref(false);
+
+const selectedDriverType = computed(() => {
+  const d = robotDevices.value.find(x => x.device_id === selectedDeviceId.value);
+  return d?.driver_type || '';
+});
 
 onMounted(async () => {
   await getCameras();
@@ -100,12 +131,18 @@ onMounted(async () => {
   };
 
   webrtc.onDataChannelMessage = (data) => {
-    if (driverWs && driverWs.readyState === WebSocket.OPEN) {
-      driverWs.send(data);
+    // 将 Master 通过 WebRTC DataChannel 发来的控制数据转发给后端 /robots/ws/{device_id}
+    // 期望格式为 ws.py 支持的消息，例如：
+    // {"type":"cmd.movej","joints_deg":[...],"gripper":0,"speed":30}
+    if (robotWs && robotWs.readyState === WebSocket.OPEN) {
+      robotWs.send(data);
+    } else {
+      console.warn("robot ws not ready, drop webrtc data");
     }
   };
 
-  // connectDriver(); // Disabled for video testing
+  // 进入页面先拉一次设备列表，方便直接选择串口
+  fetchRobotInfos();
 });
 
 const connectServer = () => {
@@ -119,7 +156,7 @@ const connectServer = () => {
 
 
 onUnmounted(() => {
-  if (driverWs) driverWs.close();
+  if (robotWs) robotWs.close();
 });
 
 const getCameras = async () => {
@@ -136,12 +173,88 @@ const getCameras = async () => {
   }
 };
 
-const connectDriver = () => {
-  driverWs = new WebSocket('ws://localhost:8001');
-  driverWs.onopen = () => { driverStatus.value = '已连接'; };
-  driverWs.onclose = () => {
-    driverStatus.value = '未连接';
-    setTimeout(connectDriver, 2000);
+const fetchRobotInfos = async () => {
+  isRobotBusy.value = true;
+  try {
+    const res = await fetch(`${API_BASE}/robots/infos?timeout=3.0`, { method: 'GET' });
+    if (!res.ok) throw new Error(`infos 请求失败: ${res.status}`);
+    const data = await res.json();
+    const wrapper = data?.devices ?? data;
+    const list = wrapper?.devices ?? [];
+    robotDevices.value = Array.isArray(list) ? list : [];
+    if (!selectedDeviceId.value && robotDevices.value.length > 0) {
+      selectedDeviceId.value = robotDevices.value[0].device_id;
+    }
+  } catch (e) {
+    console.error(e);
+    robotDevices.value = [];
+    selectedDeviceId.value = '';
+  } finally {
+    isRobotBusy.value = false;
+  }
+};
+
+const connectRobot = async () => {
+  if (!selectedDeviceId.value || !selectedDriverType.value) return;
+  isRobotBusy.value = true;
+  robotWsStatus.value = '连接中...';
+  try {
+    const res = await fetch(`${API_BASE}/robots/connect`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        arm_type: selectedDriverType.value,
+        device_id: selectedDeviceId.value,
+      })
+    });
+    if (!res.ok) throw new Error(`connect 请求失败: ${res.status}`);
+    await res.json();
+    robotConnected.value = true;
+    await connectRobotWs(selectedDeviceId.value);
+  } catch (e) {
+    console.error(e);
+    robotConnected.value = false;
+    robotWsStatus.value = '错误';
+  } finally {
+    isRobotBusy.value = false;
+  }
+};
+
+const connectRobotWs = async (devicePath) => {
+  if (robotWs) {
+    try { robotWs.close(); } catch {}
+    robotWs = null;
+  }
+
+  // 注意：device_id 类似 "/dev/cu.xxx"，拼接后会出现双斜杠，符合后端 {device_id:path} 的用法
+  const wsUrl = `${WS_BASE}/robots/ws/${devicePath}`;
+  robotWs = new WebSocket(wsUrl);
+
+  robotWs.onopen = () => {
+    // 按要求：先发 ping，等 hello
+    robotWsStatus.value = '握手中...';
+    robotWs.send(JSON.stringify({ type: 'ping' }));
+  };
+
+  robotWs.onerror = (err) => {
+    console.error('robot ws error', err);
+    robotWsStatus.value = '错误';
+  };
+
+  robotWs.onclose = () => {
+    robotWsStatus.value = '未连接';
+    robotConnected.value = false;
+  };
+
+  robotWs.onmessage = (event) => {
+    try {
+      const msg = JSON.parse(event.data);
+      if (msg.type === 'hello') {
+        robotWsStatus.value = '已连接';
+      }
+    } catch {
+      // ignore
+    }
   };
 };
 
