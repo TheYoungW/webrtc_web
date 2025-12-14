@@ -88,6 +88,7 @@ const isSignalingConnected = computed(() => signalingStatus.value === '已连接
 let webrtc = null;
 let robotWs = null;
 let robotStateTimer = null;
+const isDataChannelOpen = ref(false);
 
 const API_BASE = 'http://127.0.0.1:8000';
 const WS_BASE = 'ws://127.0.0.1:8000';
@@ -109,6 +110,11 @@ onMounted(() => {
   
   webrtc.onSignalingOpen = () => { 
     signalingStatus.value = '已连接';
+  };
+
+  webrtc.onDataChannelOpen = () => {
+    isDataChannelOpen.value = true;
+    console.log('[webrtc] data channel open');
   };
   
   webrtc.onRegisterSuccess = () => {
@@ -152,6 +158,7 @@ const connectServer = () => {
 onUnmounted(() => {
   stopRobotStateLoop();
   if (robotWs) robotWs.close();
+  isDataChannelOpen.value = false;
 });
 
 const fetchRobotInfos = async () => {
@@ -264,6 +271,20 @@ const connectRobotWsAndStartStateLoop = async (devicePath) => {
 
       if (msg.type === 'state') {
         robotLastState.value = msg;
+
+        // 示教臂：把读取到的关节状态通过 WebRTC DataChannel 转发给操作臂，让对方“打印并执行”
+        // 这里将 state 直接封装成后端 ws.py 支持的 cmd.movej 格式
+        if (webrtc && isDataChannelOpen.value && msg?.joints_deg) {
+          const payload = {
+            type: 'cmd.movej',
+            joints_deg: msg.joints_deg,
+            gripper: msg.gripper ?? 0.0,
+            speed: 30.0,
+            src: 'teaching_arm',
+            ts: msg.ts ?? Date.now() / 1000,
+          };
+          webrtc.sendData(JSON.stringify(payload));
+        }
         return;
       }
     } catch (e) {

@@ -131,11 +131,34 @@ onMounted(async () => {
   };
 
   webrtc.onDataChannelMessage = (data) => {
-    // 将 Master 通过 WebRTC DataChannel 发来的控制数据转发给后端 /robots/ws/{device_id}
-    // 期望格式为 ws.py 支持的消息，例如：
-    // {"type":"cmd.movej","joints_deg":[...],"gripper":0,"speed":30}
+    // 操作臂：收到示教臂数据 -> 先打印 -> 再执行（转发给后端 /robots/ws/{device_id}）
+    console.log("[webrtc] rx:", data);
+
+    // 兼容：Master 可能直接发 cmd.movej / cmd.ik 等；也可能发 state（这里转换成 cmd.movej）
+    let out = data;
+    try {
+      const msg = JSON.parse(data);
+
+      if (msg?.type === "state" && Array.isArray(msg?.joints_deg)) {
+        out = JSON.stringify({
+          type: "cmd.movej",
+          joints_deg: msg.joints_deg,
+          gripper: msg.gripper ?? 0.0,
+          speed: msg.speed ?? 30.0,
+          src: msg.src ?? "teaching_arm",
+          ts: msg.ts ?? Date.now() / 1000,
+        });
+      } else {
+        // 保持原样（cmd.* / ingest / ping 等）
+        out = JSON.stringify(msg);
+      }
+    } catch {
+      // 非 JSON 文本：原样透传
+      out = data;
+    }
+
     if (robotWs && robotWs.readyState === WebSocket.OPEN) {
-      robotWs.send(data);
+      robotWs.send(out);
     } else {
       console.warn("robot ws not ready, drop webrtc data");
     }
