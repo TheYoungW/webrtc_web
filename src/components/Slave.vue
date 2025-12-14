@@ -125,9 +125,48 @@ let webrtc = null;
 let robotWs = null;
 let pendingOffer = null;
 let robotStateTimer = null;
+let robotControlTimer = null;
 
 // -------------------- 操作臂：状态显示 --------------------
 const robotLastState = ref(null);
+
+// -------------------- 方案一：固定频率控制环（抗网络抖动） --------------------
+// 控制环频率（你可按需要调：50/100）
+const CONTROL_LOOP_HZ = 100;
+// 如果超过该时间没有更新控制帧，则停止下发（避免断流时一直重放旧目标）
+const CONTROL_MAX_AGE_MS = 250;
+
+let _latestControl = null; // { ts:number(epoch seconds), payloadStr:string }
+let _latestControlTs = -Infinity;
+
+function _nowSec() {
+  return Date.now() / 1000;
+}
+
+function _startRobotControlLoop() {
+  if (robotControlTimer) return;
+  robotControlTimer = setInterval(() => {
+    // 只有当机器人 ws 连接可用时才下发
+    if (!robotWs || robotWs.readyState !== WebSocket.OPEN) return;
+    if (!_latestControl) return;
+
+    const ageMs = (_nowSec() - (_latestControl.ts ?? _nowSec())) * 1000;
+    if (ageMs > CONTROL_MAX_AGE_MS) return;
+
+    try {
+      robotWs.send(_latestControl.payloadStr);
+    } catch (e) {
+      // ignore
+    }
+  }, Math.round(1000 / CONTROL_LOOP_HZ));
+}
+
+function _stopRobotControlLoop() {
+  if (robotControlTimer) {
+    try { clearInterval(robotControlTimer); } catch {}
+    robotControlTimer = null;
+  }
+}
 
 // -------------------- Control-first：视频限速/降优先级（让控制数据更稳） --------------------
 // 总视频上行预算（多个摄像头会均分）；按需调整
@@ -282,6 +321,7 @@ onMounted(async () => {
 
     // 兼容：Master 可能直接发 cmd.movej / cmd.ik 等；也可能发 state（这里转换成 cmd.movej）
     let out = data;
+    let inTs = null;
     try {
       const msg = JSON.parse(data);
 
@@ -294,20 +334,25 @@ onMounted(async () => {
           src: msg.src ?? "teaching_arm",
           ts: msg.ts ?? Date.now() / 1000,
         });
+        inTs = msg.ts ?? null;
       } else {
         // 保持原样（cmd.* / ingest / ping 等）
         out = JSON.stringify(msg);
+        inTs = msg?.ts ?? null;
       }
     } catch {
       // 非 JSON 文本：原样透传
       out = data;
     }
 
-    if (robotWs && robotWs.readyState === WebSocket.OPEN) {
-      robotWs.send(out);
-    } else {
-      console.warn("robot ws not ready, drop webrtc data");
+    // 方案一：不再“收到就发”，而是只更新 latest，再由固定频率控制环恒频下发
+    const ts = (typeof inTs === 'number' && Number.isFinite(inTs)) ? inTs : _nowSec();
+    if (ts <= _latestControlTs) {
+      // DataChannel ordered:false 可能乱序，旧帧丢弃
+      return;
     }
+    _latestControlTs = ts;
+    _latestControl = { ts, payloadStr: out };
   };
 
   // 进入页面先拉一次设备列表，方便直接选择串口
@@ -329,6 +374,7 @@ onUnmounted(() => {
     try { clearInterval(robotStateTimer); } catch {}
     robotStateTimer = null;
   }
+  _stopRobotControlLoop();
   if (robotWs) robotWs.close();
 });
 
@@ -421,6 +467,7 @@ const connectRobotWs = async (devicePath) => {
       try { clearInterval(robotStateTimer); } catch {}
       robotStateTimer = null;
     }
+    _stopRobotControlLoop();
   };
 
   robotWs.onmessage = (event) => {
@@ -439,6 +486,9 @@ const connectRobotWs = async (devicePath) => {
             robotWs.send(JSON.stringify({ type: 'get.state' }));
           }
         }, Math.round(1000 / 10));
+
+        // 启动固定频率控制环（用于恒频下发 latest 控制指令）
+        _startRobotControlLoop();
         return;
       }
       if (msg.type === 'state') {
