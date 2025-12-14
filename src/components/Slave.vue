@@ -133,8 +133,6 @@ const robotLastState = ref(null);
 // -------------------- 方案一：固定频率控制环（抗网络抖动） --------------------
 // 控制环频率（你可按需要调：50/100）
 const CONTROL_LOOP_HZ = 100;
-// 如果超过该时间没有更新控制帧，则停止下发（避免断流时一直重放旧目标）
-const CONTROL_MAX_AGE_MS = 250;
 
 let _latestControl = null; // { ts:number(epoch seconds), payloadStr:string }
 let _latestControlTs = -Infinity;
@@ -149,9 +147,6 @@ function _startRobotControlLoop() {
     // 只有当机器人 ws 连接可用时才下发
     if (!robotWs || robotWs.readyState !== WebSocket.OPEN) return;
     if (!_latestControl) return;
-
-    const ageMs = (_nowSec() - (_latestControl.ts ?? _nowSec())) * 1000;
-    if (ageMs > CONTROL_MAX_AGE_MS) return;
 
     try {
       robotWs.send(_latestControl.payloadStr);
