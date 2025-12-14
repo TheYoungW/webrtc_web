@@ -129,6 +129,46 @@ let robotStateTimer = null;
 // -------------------- 操作臂：状态显示 --------------------
 const robotLastState = ref(null);
 
+// -------------------- Control-first：视频限速/降优先级（让控制数据更稳） --------------------
+// 总视频上行预算（多个摄像头会均分）；按需调整
+const VIDEO_TOTAL_MAX_KBPS = 1200; // 1.2 Mbps total
+const VIDEO_MAX_FPS = 20;
+
+async function applyControlFirstVideoPolicy(pc) {
+  try {
+    const senders = pc?.getSenders ? pc.getSenders() : [];
+    const videoSenders = senders.filter(s => s?.track?.kind === 'video');
+    if (!videoSenders.length) return;
+
+    const perTrackBps = Math.floor((VIDEO_TOTAL_MAX_KBPS * 1000) / videoSenders.length);
+
+    for (const sender of videoSenders) {
+      try {
+        const params = sender.getParameters ? sender.getParameters() : {};
+        // encodings 为空时需要补一个，否则 setParameters 可能失败
+        if (!params.encodings || !params.encodings.length) params.encodings = [{}];
+
+        // 限制码率：拥塞时优先牺牲视频
+        params.encodings[0].maxBitrate = perTrackBps;
+
+        // 限制帧率（不同浏览器支持情况不同）
+        params.encodings[0].maxFramerate = VIDEO_MAX_FPS;
+
+        // 尝试设置低优先级（Chrome 支持较好；不支持会被忽略或抛错）
+        params.encodings[0].priority = 'very-low';
+        params.encodings[0].networkPriority = 'low';
+
+        await sender.setParameters(params);
+      } catch (e) {
+        // 浏览器不支持某些字段时，忽略即可
+        console.warn('[webrtc] set video sender parameters failed', e);
+      }
+    }
+  } catch (e) {
+    console.warn('[webrtc] applyControlFirstVideoPolicy failed', e);
+  }
+}
+
 // -------------------- 统计：DataChannel 接收 --------------------
 const _enc = typeof TextEncoder !== 'undefined' ? new TextEncoder() : null;
 const rxTotalBytes = ref(0);
@@ -423,7 +463,13 @@ const acceptCall = async () => {
   for (const devId of selectedDeviceIds.value) {
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
-        video: { deviceId: { exact: devId } },
+        // Control-first：在采集侧就限制分辨率/帧率，减少视频对带宽的压力
+        video: {
+          deviceId: { exact: devId },
+          width: { ideal: 640 },
+          height: { ideal: 360 },
+          frameRate: { ideal: 15, max: VIDEO_MAX_FPS },
+        },
         audio: false
       });
       streams.push(stream);
@@ -451,6 +497,9 @@ const acceptCall = async () => {
         webrtc.pc.addTrack(track, stream);
       });
     });
+
+    // Control-first：把视频发送端限速 + 降优先级（避免视频挤占控制数据）
+    await applyControlFirstVideoPolicy(webrtc.pc);
 
     const offerDesc = new RTCSessionDescription({
       type: 'offer',

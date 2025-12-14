@@ -133,9 +133,12 @@ export class WebRTCManager {
       this.pc.addTransceiver('video', { direction: 'recvonly' });
     }
 
+    // Control-first: datachannel 使用高优先级 + 不可靠低延迟（丢包可接受）
     const dc = this.pc.createDataChannel("control", {
       ordered: false,
-      maxRetransmits: 0
+      maxRetransmits: 0,
+      // 说明：不同浏览器支持程度不同；Chrome 通常支持 priority
+      priority: "high",
     });
     this.setupDataChannel(dc);
 
