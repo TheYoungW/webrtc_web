@@ -57,6 +57,17 @@
 
       <div v-if="robotLastState" class="robot-state">
         <div class="robot-state-title">机器人状态（get.state）</div>
+        <div class="robot-stats" v-if="txStats.frames > 0">
+          <div class="robot-stats-title">实时统计（示教臂 -> DataChannel 发送）</div>
+          <div class="robot-stats-grid">
+            <div class="robot-stats-item"><span>FPS</span><b>{{ txStats.fps.toFixed(1) }}</b></div>
+            <div class="robot-stats-item"><span>Δt P50</span><b>{{ txStats.dtP50Ms.toFixed(1) }} ms</b></div>
+            <div class="robot-stats-item"><span>Δt P95</span><b>{{ txStats.dtP95Ms.toFixed(1) }} ms</b></div>
+            <div class="robot-stats-item"><span>Δt P99</span><b>{{ txStats.dtP99Ms.toFixed(1) }} ms</b></div>
+            <div class="robot-stats-item"><span>已发送帧</span><b>{{ txStats.frames }}</b></div>
+            <div class="robot-stats-item"><span>总发送量</span><b>{{ formatBytes(txStats.totalBytes) }}</b></div>
+          </div>
+        </div>
         <pre class="robot-state-pre">{{ JSON.stringify(robotLastState, null, 2) }}</pre>
       </div>
     </div>
@@ -89,6 +100,78 @@ let webrtc = null;
 let robotWs = null;
 let robotStateTimer = null;
 const isDataChannelOpen = ref(false);
+
+// -------------------- 统计：示教臂 DataChannel 发送 --------------------
+const _enc = typeof TextEncoder !== 'undefined' ? new TextEncoder() : null;
+const txTotalBytes = ref(0);
+const txFrames = ref(0);
+const _txFrameTimesMs = []; // performance.now()
+const _txDeltaMs = []; // inter-frame Δt
+const txStats = ref({
+  fps: 0,
+  dtP50Ms: 0,
+  dtP95Ms: 0,
+  dtP99Ms: 0,
+  frames: 0,
+  totalBytes: 0,
+});
+
+function _percentile(sorted, p) {
+  if (!sorted.length) return 0;
+  const idx = (sorted.length - 1) * p;
+  const lo = Math.floor(idx);
+  const hi = Math.ceil(idx);
+  if (lo === hi) return sorted[lo];
+  const w = idx - lo;
+  return sorted[lo] * (1 - w) + sorted[hi] * w;
+}
+
+function formatBytes(bytes) {
+  if (!Number.isFinite(bytes)) return '0 B';
+  const units = ['B', 'KB', 'MB', 'GB'];
+  let v = Math.max(0, bytes);
+  let i = 0;
+  while (v >= 1024 && i < units.length - 1) {
+    v /= 1024;
+    i += 1;
+  }
+  return `${v.toFixed(i === 0 ? 0 : 2)} ${units[i]}`;
+}
+
+function _updateTxStats() {
+  const now = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
+  // FPS: 最近 1s 内的帧数
+  while (_txFrameTimesMs.length && now - _txFrameTimesMs[0] > 1000) _txFrameTimesMs.shift();
+  const fps = _txFrameTimesMs.length;
+
+  const tail = _txDeltaMs.slice(-300);
+  const sorted = tail.slice().sort((a, b) => a - b);
+  txStats.value = {
+    fps,
+    dtP50Ms: _percentile(sorted, 0.50),
+    dtP95Ms: _percentile(sorted, 0.95),
+    dtP99Ms: _percentile(sorted, 0.99),
+    frames: txFrames.value,
+    totalBytes: txTotalBytes.value,
+  };
+}
+
+function _recordTxFrame(payloadStr) {
+  const now = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
+  if (_txFrameTimesMs.length) {
+    const dt = now - _txFrameTimesMs[_txFrameTimesMs.length - 1];
+    if (Number.isFinite(dt) && dt >= 0) _txDeltaMs.push(dt);
+    if (_txDeltaMs.length > 1000) _txDeltaMs.splice(0, _txDeltaMs.length - 1000);
+  }
+  _txFrameTimesMs.push(now);
+  txFrames.value += 1;
+
+  let bytes = 0;
+  if (_enc) bytes = _enc.encode(payloadStr).length;
+  else bytes = (payloadStr || '').length; // fallback
+  txTotalBytes.value += bytes;
+  _updateTxStats();
+}
 
 const API_BASE = 'http://127.0.0.1:8000';
 const WS_BASE = 'ws://127.0.0.1:8000';
@@ -265,7 +348,7 @@ const connectRobotWsAndStartStateLoop = async (devicePath) => {
           if (robotWs && robotWs.readyState === WebSocket.OPEN) {
             robotWs.send(JSON.stringify({ type: 'get.state' }));
           }
-        }, Math.round(1000 / 60));
+        }, Math.round(1000 / 100));
         return;
       }
 
@@ -279,11 +362,13 @@ const connectRobotWsAndStartStateLoop = async (devicePath) => {
             type: 'cmd.movej',
             joints_deg: msg.joints_deg,
             gripper: msg.gripper ?? 0.0,
-            speed: 30.0,
+            speed: 200.0,
             src: 'teaching_arm',
             ts: msg.ts ?? Date.now() / 1000,
           };
-          webrtc.sendData(JSON.stringify(payload));
+          const payloadStr = JSON.stringify(payload);
+          webrtc.sendData(payloadStr);
+          _recordTxFrame(payloadStr);
         }
         return;
       }
@@ -385,6 +470,48 @@ const startCall = async () => {
   border-radius: 10px;
   font-size: 12px;
   line-height: 1.35;
+}
+
+.robot-stats {
+  margin: 10px 0 10px 0;
+  padding: 10px 12px;
+  border-radius: 12px;
+  border: 1px solid rgba(0, 0, 0, 0.08);
+  background: rgba(0, 0, 0, 0.02);
+}
+
+.robot-stats-title {
+  font-size: 0.85rem;
+  color: #666;
+  margin-bottom: 8px;
+}
+
+.robot-stats-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px 10px;
+}
+
+.robot-stats-item {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 8px 10px;
+  border-radius: 10px;
+  background: #fff;
+  border: 1px solid rgba(0, 0, 0, 0.06);
+}
+
+.robot-stats-item span {
+  color: #666;
+  font-size: 12px;
+}
+
+.robot-stats-item b {
+  font-size: 12px;
+  font-weight: 700;
+  color: #111;
 }
 
 .video-wrapper {

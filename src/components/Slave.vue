@@ -74,6 +74,36 @@
         <span class="status-badge connected">实时</span>
       </div>
     </div>
+
+    <!-- 操作臂：连接成功后的数据显示 & 统计 -->
+    <div class="card exec-panel" v-show="isCallActive">
+      <div class="header">
+        <h2>操作臂数据面板</h2>
+        <div class="status-indicators">
+          <span class="status-badge" :class="{ connected: robotWsStatus === '已连接' }">
+            <span class="status-dot"></span>
+            机器人: {{ robotWsStatus }}
+          </span>
+        </div>
+      </div>
+
+      <div class="exec-stats" v-if="rxStats.frames > 0">
+        <div class="exec-stats-title">实时统计（DataChannel 接收）</div>
+        <div class="exec-stats-grid">
+          <div class="exec-stats-item"><span>FPS</span><b>{{ rxStats.fps.toFixed(1) }}</b></div>
+          <div class="exec-stats-item"><span>Δt P50</span><b>{{ rxStats.dtP50Ms.toFixed(1) }} ms</b></div>
+          <div class="exec-stats-item"><span>Δt P95</span><b>{{ rxStats.dtP95Ms.toFixed(1) }} ms</b></div>
+          <div class="exec-stats-item"><span>Δt P99</span><b>{{ rxStats.dtP99Ms.toFixed(1) }} ms</b></div>
+          <div class="exec-stats-item"><span>已接收帧</span><b>{{ rxStats.frames }}</b></div>
+          <div class="exec-stats-item"><span>总接收量</span><b>{{ formatBytes(rxStats.totalBytes) }}</b></div>
+        </div>
+      </div>
+
+      <div v-if="robotLastState" class="robot-state">
+        <div class="robot-state-title">机器人状态（get.state）</div>
+        <pre class="robot-state-pre">{{ JSON.stringify(robotLastState, null, 2) }}</pre>
+      </div>
+    </div>
   </div>
 </template>
 
@@ -94,6 +124,81 @@ const localVideo = ref(null);
 let webrtc = null;
 let robotWs = null;
 let pendingOffer = null;
+let robotStateTimer = null;
+
+// -------------------- 操作臂：状态显示 --------------------
+const robotLastState = ref(null);
+
+// -------------------- 统计：DataChannel 接收 --------------------
+const _enc = typeof TextEncoder !== 'undefined' ? new TextEncoder() : null;
+const rxTotalBytes = ref(0);
+const rxFrames = ref(0);
+const _rxFrameTimesMs = [];
+const _rxDeltaMs = [];
+const rxStats = ref({
+  fps: 0,
+  dtP50Ms: 0,
+  dtP95Ms: 0,
+  dtP99Ms: 0,
+  frames: 0,
+  totalBytes: 0,
+});
+
+function _percentile(sorted, p) {
+  if (!sorted.length) return 0;
+  const idx = (sorted.length - 1) * p;
+  const lo = Math.floor(idx);
+  const hi = Math.ceil(idx);
+  if (lo === hi) return sorted[lo];
+  const w = idx - lo;
+  return sorted[lo] * (1 - w) + sorted[hi] * w;
+}
+
+function formatBytes(bytes) {
+  if (!Number.isFinite(bytes)) return '0 B';
+  const units = ['B', 'KB', 'MB', 'GB'];
+  let v = Math.max(0, bytes);
+  let i = 0;
+  while (v >= 1024 && i < units.length - 1) {
+    v /= 1024;
+    i += 1;
+  }
+  return `${v.toFixed(i === 0 ? 0 : 2)} ${units[i]}`;
+}
+
+function _updateRxStats() {
+  const now = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
+  while (_rxFrameTimesMs.length && now - _rxFrameTimesMs[0] > 1000) _rxFrameTimesMs.shift();
+  const fps = _rxFrameTimesMs.length;
+
+  const tail = _rxDeltaMs.slice(-300);
+  const sorted = tail.slice().sort((a, b) => a - b);
+  rxStats.value = {
+    fps,
+    dtP50Ms: _percentile(sorted, 0.50),
+    dtP95Ms: _percentile(sorted, 0.95),
+    dtP99Ms: _percentile(sorted, 0.99),
+    frames: rxFrames.value,
+    totalBytes: rxTotalBytes.value,
+  };
+}
+
+function _recordRxFrame(dataStr) {
+  const now = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
+  if (_rxFrameTimesMs.length) {
+    const dt = now - _rxFrameTimesMs[_rxFrameTimesMs.length - 1];
+    if (Number.isFinite(dt) && dt >= 0) _rxDeltaMs.push(dt);
+    if (_rxDeltaMs.length > 1000) _rxDeltaMs.splice(0, _rxDeltaMs.length - 1000);
+  }
+  _rxFrameTimesMs.push(now);
+  rxFrames.value += 1;
+
+  let bytes = 0;
+  if (_enc) bytes = _enc.encode(dataStr).length;
+  else bytes = (dataStr || '').length;
+  rxTotalBytes.value += bytes;
+  _updateRxStats();
+}
 
 const API_BASE = 'http://127.0.0.1:8000';
 const WS_BASE = 'ws://127.0.0.1:8000';
@@ -133,6 +238,7 @@ onMounted(async () => {
   webrtc.onDataChannelMessage = (data) => {
     // 操作臂：收到示教臂数据 -> 先打印 -> 再执行（转发给后端 /robots/ws/{device_id}）
     console.log("[webrtc] rx:", data);
+    _recordRxFrame(data);
 
     // 兼容：Master 可能直接发 cmd.movej / cmd.ik 等；也可能发 state（这里转换成 cmd.movej）
     let out = data;
@@ -179,6 +285,10 @@ const connectServer = () => {
 
 
 onUnmounted(() => {
+  if (robotStateTimer) {
+    try { clearInterval(robotStateTimer); } catch {}
+    robotStateTimer = null;
+  }
   if (robotWs) robotWs.close();
 });
 
@@ -267,6 +377,10 @@ const connectRobotWs = async (devicePath) => {
   robotWs.onclose = () => {
     robotWsStatus.value = '未连接';
     robotConnected.value = false;
+    if (robotStateTimer) {
+      try { clearInterval(robotStateTimer); } catch {}
+      robotStateTimer = null;
+    }
   };
 
   robotWs.onmessage = (event) => {
@@ -274,6 +388,22 @@ const connectRobotWs = async (devicePath) => {
       const msg = JSON.parse(event.data);
       if (msg.type === 'hello') {
         robotWsStatus.value = '已连接';
+        // 连接成功后：轮询 state 用于显示（默认 10Hz，避免影响执行）
+        try { robotWs.send(JSON.stringify({ type: 'get.state' })); } catch {}
+        if (robotStateTimer) {
+          try { clearInterval(robotStateTimer); } catch {}
+          robotStateTimer = null;
+        }
+        robotStateTimer = setInterval(() => {
+          if (robotWs && robotWs.readyState === WebSocket.OPEN) {
+            robotWs.send(JSON.stringify({ type: 'get.state' }));
+          }
+        }, Math.round(1000 / 10));
+        return;
+      }
+      if (msg.type === 'state') {
+        robotLastState.value = msg;
+        return;
       }
     } catch {
       // ignore
@@ -451,5 +581,73 @@ video {
   position: absolute;
   top: 16px;
   left: 16px;
+}
+
+.exec-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.exec-stats {
+  padding: 10px 12px;
+  border-radius: 12px;
+  border: 1px solid rgba(0, 0, 0, 0.08);
+  background: rgba(0, 0, 0, 0.02);
+}
+
+.exec-stats-title {
+  font-size: 0.85rem;
+  color: #666;
+  margin-bottom: 8px;
+}
+
+.exec-stats-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px 10px;
+}
+
+.exec-stats-item {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 8px 10px;
+  border-radius: 10px;
+  background: #fff;
+  border: 1px solid rgba(0, 0, 0, 0.06);
+}
+
+.exec-stats-item span {
+  color: #666;
+  font-size: 12px;
+}
+
+.exec-stats-item b {
+  font-size: 12px;
+  font-weight: 700;
+  color: #111;
+}
+
+.robot-state {
+  padding-top: 4px;
+}
+
+.robot-state-title {
+  font-size: 0.85rem;
+  color: #666;
+  margin-bottom: 8px;
+}
+
+.robot-state-pre {
+  margin: 0;
+  max-height: 220px;
+  overflow: auto;
+  background: rgba(0, 0, 0, 0.04);
+  padding: 10px 12px;
+  border-radius: 10px;
+  font-size: 12px;
+  line-height: 1.35;
 }
 </style>
