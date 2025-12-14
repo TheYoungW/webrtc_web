@@ -126,6 +126,12 @@ let robotWs = null;
 let pendingOffer = null;
 let robotStateTimer = null;
 
+// NEW: Jitter Buffer 相关变量
+const cmdBuffer = [];          // 指令缓冲区
+let cmdConsumerTimer = null;   // 消费定时器
+const lastCmdString = ref(null); // 记录上一帧指令，用于断流时保持姿态
+const CONSUME_INTERVAL = 10;   // 消费间隔 10ms (100Hz)，与 Master 发送频率对齐
+
 // -------------------- 操作臂：状态显示 --------------------
 const robotLastState = ref(null);
 
@@ -304,9 +310,10 @@ onMounted(async () => {
     }
 
     if (robotWs && robotWs.readyState === WebSocket.OPEN) {
-      robotWs.send(out);
-    } else {
-      console.warn("robot ws not ready, drop webrtc data");
+      cmdBuffer.push(out);
+      
+      // 可选：如果积压过多（如超过 300 帧/3秒），虽然要求不丢包，但为了实时性安全，
+      // 极端情况下可能需要策略（这里暂不处理，严格遵守“不丢包”）
     }
   };
 
@@ -329,6 +336,9 @@ onUnmounted(() => {
     try { clearInterval(robotStateTimer); } catch {}
     robotStateTimer = null;
   }
+  // NEW: 清理消费者
+  stopCmdConsumer();
+  
   if (robotWs) robotWs.close();
 });
 
@@ -398,6 +408,9 @@ const connectRobotWs = async (devicePath) => {
     try { robotWs.close(); } catch {}
     robotWs = null;
   }
+  
+  // NEW: 确保之前的消费者已停止
+  stopCmdConsumer();
 
   // 注意：device_id 类似 "/dev/cu.xxx"，拼接后会出现双斜杠，符合后端 {device_id:path} 的用法
   const wsUrl = `${WS_BASE}/robots/ws/${devicePath}`;
@@ -407,6 +420,9 @@ const connectRobotWs = async (devicePath) => {
     // 按要求：先发 ping，等 hello
     robotWsStatus.value = '握手中...';
     robotWs.send(JSON.stringify({ type: 'ping' }));
+    
+    // NEW: 连接建立，开始启动指令消费循环
+    startCmdConsumer();
   };
 
   robotWs.onerror = (err) => {
@@ -421,6 +437,8 @@ const connectRobotWs = async (devicePath) => {
       try { clearInterval(robotStateTimer); } catch {}
       robotStateTimer = null;
     }
+    // NEW: 连接断开，停止消费
+    stopCmdConsumer();
   };
 
   robotWs.onmessage = (event) => {
@@ -526,6 +544,45 @@ const acceptCall = async () => {
     status.value = '错误';
     isCallActive.value = false;
   }
+};
+
+// NEW: 启动消费者循环
+const startCmdConsumer = () => {
+  stopCmdConsumer();
+  // 以 10ms (100Hz) 的稳定频率向机器人发送指令
+  cmdConsumerTimer = setInterval(() => {
+    if (!robotWs || robotWs.readyState !== WebSocket.OPEN) return;
+
+    if (cmdBuffer.length > 0) {
+      // 缓冲区有数据：取出一帧发送（平滑由网络突发导致的数据堆积）
+      const msg = cmdBuffer.shift();
+      try {
+        robotWs.send(msg);
+        lastCmdString.value = msg; // 更新“最后已知姿态”
+      } catch (e) {
+        console.error('Robot send error:', e);
+      }
+    } else {
+      // 缓冲区为空（网络时延/卡顿）：
+      // 执行“保持原来的姿态”策略 -> 重发上一帧指令
+      // 这能防止机器人因为没收到指令而减速停车，也防止乱动
+      if (lastCmdString.value) {
+        try {
+          robotWs.send(lastCmdString.value);
+        } catch (e) {}
+      }
+    }
+  }, CONSUME_INTERVAL);
+};
+
+// NEW: 停止消费者循环
+const stopCmdConsumer = () => {
+  if (cmdConsumerTimer) {
+    clearInterval(cmdConsumerTimer);
+    cmdConsumerTimer = null;
+  }
+  cmdBuffer.length = 0;   // 清空积压
+  lastCmdString.value = null;
 };
 </script>
 
