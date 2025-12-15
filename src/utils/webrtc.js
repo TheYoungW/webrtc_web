@@ -136,7 +136,7 @@ export class WebRTCManager {
     // Control-first: datachannel 使用高优先级 + 有序不可靠（按顺序到达，但允许丢包不重传）
     const dc = this.pc.createDataChannel("control", {
       // ordered 默认就是 true，这里显式写上更清晰
-      ordered: true,
+      ordered: false,
       // 允许丢包：不重传（可能会牺牲部分消息，但不会为重传付出额外时延）
       maxRetransmits: 0,
       // 说明：不同浏览器支持程度不同；Chrome 通常支持 priority

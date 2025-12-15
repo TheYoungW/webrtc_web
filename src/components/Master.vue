@@ -362,7 +362,7 @@ const connectRobotWsAndStartStateLoop = async (devicePath) => {
             type: 'cmd.movej',
             joints_deg: msg.joints_deg,
             gripper: msg.gripper ?? 0.0,
-            speed: 200.0,
+            speed: 350,
             src: 'teaching_arm',
             ts: msg.ts ?? Date.now() / 1000,
           };
