@@ -96,6 +96,7 @@
           <div class="exec-stats-item"><span>Δt P99</span><b>{{ rxStats.dtP99Ms.toFixed(1) }} ms</b></div>
           <div class="exec-stats-item"><span>已接收帧</span><b>{{ rxStats.frames }}</b></div>
           <div class="exec-stats-item"><span>总接收量</span><b>{{ formatBytes(rxStats.totalBytes) }}</b></div>
+          <div class="exec-stats-item"><span>队列大小</span><b>{{ cmdBufferSize }}</b></div>
         </div>
       </div>
 
@@ -111,7 +112,7 @@
 import { ref, onMounted, onUnmounted, computed } from 'vue';
 import { WebRTCManager } from '../utils/webrtc';
 
-const deviceId = ref('robot_01');
+const deviceId = ref('');
 const selectedDeviceIds = ref([]);
 const videoDevices = ref([]);
 const status = ref('未连接');
@@ -130,7 +131,8 @@ let robotStateTimer = null;
 const cmdBuffer = [];          // 指令缓冲区
 let cmdConsumerTimer = null;   // 消费定时器
 const lastCmdString = ref(null); // 记录上一帧指令，用于断流时保持姿态
-const CONSUME_INTERVAL = 10;   // 消费间隔 10ms (100Hz)，与 Master 发送频率对齐
+const cmdBufferSize = ref(0);  // 队列大小（用于显示）
+const CONSUME_INTERVAL = 8;   // 消费间隔 8ms (125Hz)，与 Master 发送频率对齐
 
 // -------------------- 操作臂：状态显示 --------------------
 const robotLastState = ref(null);
@@ -263,7 +265,7 @@ const selectedDriverType = computed(() => {
 onMounted(async () => {
   await getCameras();
 
-  webrtc = new WebRTCManager(deviceId.value, 'wss://rtc.sparklingrobo.com/signaling', 'EXECUTION_ARM');
+  webrtc = new WebRTCManager(deviceId.value || '', 'wss://rtc.sparklingrobo.com/signaling', 'EXECUTION_ARM');
   
   webrtc.onSignalingOpen = () => { signalingStatus.value = '已连接'; };
   webrtc.onSignalingClose = () => { signalingStatus.value = '未连接'; };
@@ -311,9 +313,10 @@ onMounted(async () => {
 
     if (robotWs && robotWs.readyState === WebSocket.OPEN) {
       cmdBuffer.push(out);
+      cmdBufferSize.value = cmdBuffer.length;
       
       // 可选：如果积压过多（如超过 300 帧/3秒），虽然要求不丢包，但为了实时性安全，
-      // 极端情况下可能需要策略（这里暂不处理，严格遵守“不丢包”）
+      // 极端情况下可能需要策略（这里暂不处理，严格遵守"不丢包"）
     }
   };
 
@@ -367,6 +370,14 @@ const fetchRobotInfos = async () => {
     robotDevices.value = Array.isArray(list) ? list : [];
     if (!selectedDeviceId.value && robotDevices.value.length > 0) {
       selectedDeviceId.value = robotDevices.value[0].device_id;
+    }
+    // 自动设置设备 ID 为第一个设备的 serial_number
+    if (!deviceId.value && robotDevices.value.length > 0 && robotDevices.value[0].serial_number) {
+      deviceId.value = robotDevices.value[0].serial_number;
+      // 更新 WebRTCManager 的 myId
+      if (webrtc) {
+        webrtc.myId = deviceId.value;
+      }
     }
   } catch (e) {
     console.error(e);
@@ -549,16 +560,17 @@ const acceptCall = async () => {
 // NEW: 启动消费者循环
 const startCmdConsumer = () => {
   stopCmdConsumer();
-  // 以 10ms (100Hz) 的稳定频率向机器人发送指令
+  // 以 8ms (125Hz) 的稳定频率向机器人发送指令
   cmdConsumerTimer = setInterval(() => {
     if (!robotWs || robotWs.readyState !== WebSocket.OPEN) return;
 
     if (cmdBuffer.length > 0) {
       // 缓冲区有数据：取出一帧发送（平滑由网络突发导致的数据堆积）
       const msg = cmdBuffer.shift();
+      cmdBufferSize.value = cmdBuffer.length;
       try {
         robotWs.send(msg);
-        lastCmdString.value = msg; // 更新“最后已知姿态”
+        lastCmdString.value = msg; // 更新"最后已知姿态"
       } catch (e) {
         console.error('Robot send error:', e);
       }
@@ -582,6 +594,7 @@ const stopCmdConsumer = () => {
     cmdConsumerTimer = null;
   }
   cmdBuffer.length = 0;   // 清空积压
+  cmdBufferSize.value = 0;
   lastCmdString.value = null;
 };
 </script>

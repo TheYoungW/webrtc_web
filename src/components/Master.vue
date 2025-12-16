@@ -87,8 +87,8 @@
 import { ref, onMounted, onUnmounted, computed } from 'vue';
 import { WebRTCManager } from '../utils/webrtc';
 
-const deviceId = ref('master_01');
-const targetId = ref('robot_01');
+const deviceId = ref('');
+const targetId = ref('ADFS');
 const status = ref('未连接');
 const signalingStatus = ref('未连接');
 const isConnected = ref(false);
@@ -189,7 +189,7 @@ const selectedDriverType = computed(() => {
 });
 
 onMounted(() => {
-  webrtc = new WebRTCManager(deviceId.value, 'wss://rtc.sparklingrobo.com/signaling', 'TEACHING_ARM');
+  webrtc = new WebRTCManager(deviceId.value || '', 'wss://rtc.sparklingrobo.com/signaling', 'TEACHING_ARM');
   
   webrtc.onSignalingOpen = () => { 
     signalingStatus.value = '已连接';
@@ -260,6 +260,14 @@ const fetchRobotInfos = async () => {
     robotDevices.value = Array.isArray(list) ? list : [];
     if (!selectedDeviceId.value && robotDevices.value.length > 0) {
       selectedDeviceId.value = robotDevices.value[0].device_id;
+    }
+    // 自动设置本机 ID 为第一个设备的 serial_number
+    if (!deviceId.value && robotDevices.value.length > 0 && robotDevices.value[0].serial_number) {
+      deviceId.value = robotDevices.value[0].serial_number;
+      // 更新 WebRTCManager 的 myId
+      if (webrtc) {
+        webrtc.myId = deviceId.value;
+      }
     }
   } catch (e) {
     console.error(e);
