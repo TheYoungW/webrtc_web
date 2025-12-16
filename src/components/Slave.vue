@@ -101,7 +101,7 @@
       </div>
 
       <div v-if="robotLastState" class="robot-state">
-        <div class="robot-state-title">机器人状态（get.state）</div>
+        <div class="robot-state-title">机器人数据展示</div>
         <pre class="robot-state-pre">{{ JSON.stringify(robotLastState, null, 2) }}</pre>
       </div>
     </div>
@@ -125,7 +125,6 @@ const localVideo = ref(null);
 let webrtc = null;
 let robotWs = null;
 let pendingOffer = null;
-let robotStateTimer = null;
 
 // NEW: Jitter Buffer 相关变量
 const cmdBuffer = [];          // 指令缓冲区
@@ -134,7 +133,7 @@ const lastCmdString = ref(null); // 记录上一帧指令，用于断流时保�
 const cmdBufferSize = ref(0);  // 队列大小（用于显示）
 const CONSUME_INTERVAL = 8;   // 消费间隔 8ms (125Hz)，与 Master 发送频率对齐
 
-// -------------------- 操作臂：状态显示 --------------------
+// -------------------- 操作臂：WebRTC 接收数据展示 --------------------
 const robotLastState = ref(null);
 
 // -------------------- Control-first：视频限速/降优先级（让控制数据更稳） --------------------
@@ -288,6 +287,15 @@ onMounted(async () => {
     console.log("[webrtc] rx:", data);
     _recordRxFrame(data);
 
+    // 保存接收到的数据用于显示
+    try {
+      const msg = JSON.parse(data);
+      robotLastState.value = msg;
+    } catch {
+      // 非 JSON 文本：保存原始数据
+      robotLastState.value = { raw: data };
+    }
+
     // 兼容：Master 可能直接发 cmd.movej / cmd.ik 等；也可能发 state（这里转换成 cmd.movej）
     let out = data;
     try {
@@ -335,10 +343,6 @@ const connectServer = () => {
 
 
 onUnmounted(() => {
-  if (robotStateTimer) {
-    try { clearInterval(robotStateTimer); } catch {}
-    robotStateTimer = null;
-  }
   // NEW: 清理消费者
   stopCmdConsumer();
   
@@ -444,10 +448,6 @@ const connectRobotWs = async (devicePath) => {
   robotWs.onclose = () => {
     robotWsStatus.value = '未连接';
     robotConnected.value = false;
-    if (robotStateTimer) {
-      try { clearInterval(robotStateTimer); } catch {}
-      robotStateTimer = null;
-    }
     // NEW: 连接断开，停止消费
     stopCmdConsumer();
   };
@@ -457,23 +457,9 @@ const connectRobotWs = async (devicePath) => {
       const msg = JSON.parse(event.data);
       if (msg.type === 'hello') {
         robotWsStatus.value = '已连接';
-        // 连接成功后：轮询 state 用于显示（默认 10Hz，避免影响执行）
-        try { robotWs.send(JSON.stringify({ type: 'get.state' })); } catch {}
-        if (robotStateTimer) {
-          try { clearInterval(robotStateTimer); } catch {}
-          robotStateTimer = null;
-        }
-        robotStateTimer = setInterval(() => {
-          if (robotWs && robotWs.readyState === WebSocket.OPEN) {
-            robotWs.send(JSON.stringify({ type: 'get.state' }));
-          }
-        }, Math.round(1000 / 10));
         return;
       }
-      if (msg.type === 'state') {
-        robotLastState.value = msg;
-        return;
-      }
+      // 不再通过 WebSocket 获取状态，状态数据从 WebRTC 接收
     } catch {
       // ignore
     }
