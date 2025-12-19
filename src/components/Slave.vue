@@ -51,6 +51,37 @@
         </div>
       </div>
 
+      <!-- 视频质量设置 -->
+      <div class="form-group">
+        <label>视频质量设置</label>
+        <div class="video-quality-controls">
+          <div class="quality-row">
+            <label class="quality-label">分辨率</label>
+            <select v-model="selectedResolution" :disabled="isCallActive" style="width: 100%; padding: 0.8rem; border-radius: 12px; border: 1px solid rgba(0,0,0,0.1);">
+              <option v-for="res in resolutionOptions" :key="res.value" :value="res.value">
+                {{ res.label }}
+              </option>
+            </select>
+          </div>
+          <div class="quality-row">
+            <label class="quality-label">帧率</label>
+            <select v-model="selectedFrameRate" :disabled="isCallActive" style="width: 100%; padding: 0.8rem; border-radius: 12px; border: 1px solid rgba(0,0,0,0.1);">
+              <option v-for="fps in frameRateOptions" :key="fps" :value="fps">
+                {{ fps }} fps
+              </option>
+            </select>
+          </div>
+          <div class="quality-row">
+            <label class="quality-label">码率</label>
+            <select v-model="selectedBitrate" :disabled="isCallActive" style="width: 100%; padding: 0.8rem; border-radius: 12px; border: 1px solid rgba(0,0,0,0.1);">
+              <option v-for="br in bitrateOptions" :key="br.value" :value="br.value">
+                {{ br.label }}
+              </option>
+            </select>
+          </div>
+        </div>
+      </div>
+
       <div class="call-status" v-if="incomingCall">
         <div class="incoming-alert">
           <div class="caller-info">
@@ -122,6 +153,31 @@ const incomingCallSender = ref('');
 const isCallActive = ref(false);
 const localVideo = ref(null);
 
+// 视频质量设置
+const selectedResolution = ref('640x360');
+const selectedFrameRate = ref(15);
+const selectedBitrate = ref(1200);
+
+// 分辨率选项
+const resolutionOptions = [
+  { label: '360p (640×360)', value: '640x360', width: 640, height: 360 },
+  { label: '480p (854×480)', value: '854x480', width: 854, height: 480 },
+  { label: '720p (1280×720)', value: '1280x720', width: 1280, height: 720 },
+  { label: '1080p (1920×1080)', value: '1920x1080', width: 1920, height: 1080 },
+];
+
+// 帧率选项
+const frameRateOptions = [15, 20, 24, 30, 60];
+
+// 码率选项（Kbps）
+const bitrateOptions = [
+  { label: '低 (800 Kbps)', value: 800 },
+  { label: '中 (1200 Kbps)', value: 1200 },
+  { label: '高 (2000 Kbps)', value: 2000 },
+  { label: '超高 (3000 Kbps)', value: 3000 },
+  { label: '自动', value: 'auto' },
+];
+
 let webrtc = null;
 let robotWs = null;
 let pendingOffer = null;
@@ -138,8 +194,20 @@ const robotLastState = ref(null);
 
 // -------------------- Control-first：视频限速/降优先级（让控制数据更稳） --------------------
 // 总视频上行预算（多个摄像头会均分）；按需调整
-const VIDEO_TOTAL_MAX_KBPS = 1200; // 1.2 Mbps total
-const VIDEO_MAX_FPS = 20;
+const VIDEO_TOTAL_MAX_KBPS = computed(() => {
+  if (selectedBitrate.value === 'auto') {
+    // 根据分辨率自动计算码率
+    const res = resolutionOptions.find(r => r.value === selectedResolution.value);
+    if (res) {
+      const pixels = res.width * res.height;
+      // 简单的码率估算：每像素约 0.001-0.002 Kbps
+      return Math.floor(pixels * 0.0015);
+    }
+    return 1200;
+  }
+  return selectedBitrate.value;
+});
+const VIDEO_MAX_FPS = computed(() => selectedFrameRate.value);
 
 async function applyControlFirstVideoPolicy(pc) {
   try {
@@ -147,7 +215,7 @@ async function applyControlFirstVideoPolicy(pc) {
     const videoSenders = senders.filter(s => s?.track?.kind === 'video');
     if (!videoSenders.length) return;
 
-    const perTrackBps = Math.floor((VIDEO_TOTAL_MAX_KBPS * 1000) / videoSenders.length);
+    const perTrackBps = Math.floor((VIDEO_TOTAL_MAX_KBPS.value * 1000) / videoSenders.length);
 
     for (const sender of videoSenders) {
       try {
@@ -159,7 +227,7 @@ async function applyControlFirstVideoPolicy(pc) {
         params.encodings[0].maxBitrate = perTrackBps;
 
         // 限制帧率（不同浏览器支持情况不同）
-        params.encodings[0].maxFramerate = VIDEO_MAX_FPS;
+        params.encodings[0].maxFramerate = VIDEO_MAX_FPS.value;
 
         // 尝试设置低优先级（Chrome 支持较好；不支持会被忽略或抛错）
         params.encodings[0].priority = 'very-low';
@@ -473,6 +541,12 @@ const acceptCall = async () => {
   isCallActive.value = true;
   incomingCall.value = false;
 
+  // 解析选择的分辨率
+  const res = resolutionOptions.find(r => r.value === selectedResolution.value);
+  const targetWidth = res?.width || 640;
+  const targetHeight = res?.height || 360;
+  const targetFps = selectedFrameRate.value;
+
   // Get streams for all selected cameras
   const streams = [];
   for (const devId of selectedDeviceIds.value) {
@@ -481,9 +555,9 @@ const acceptCall = async () => {
         // Control-first：在采集侧就限制分辨率/帧率，减少视频对带宽的压力
         video: {
           deviceId: { exact: devId },
-          width: { ideal: 640 },
-          height: { ideal: 360 },
-          frameRate: { ideal: 15, max: VIDEO_MAX_FPS },
+          width: { ideal: targetWidth },
+          height: { ideal: targetHeight },
+          frameRate: { ideal: targetFps, max: targetFps },
         },
         audio: false
       });
@@ -754,5 +828,24 @@ video {
   border-radius: 10px;
   font-size: 12px;
   line-height: 1.35;
+}
+
+.video-quality-controls {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.quality-row {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.quality-label {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-secondary);
+  text-transform: uppercase;
 }
 </style>
