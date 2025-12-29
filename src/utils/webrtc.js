@@ -44,7 +44,8 @@ export class WebRTCManager {
           username: 'synria',
           credential: 'xuanya666'
         }
-      ]
+      ],
+      iceTransportPolicy: 'relay'
     };
   }
 
