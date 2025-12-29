@@ -19,9 +19,31 @@ export class WebRTCManager {
     this.messageQueue = [];
     this.isSending = false;
 
+    // ICE 服务器配置：多服务器提高可靠性和容错性
+    // STUN: 用于 NAT 穿透，获取公网 IP 和端口
+    // TURN: 用于中继，当直连失败时使用（需要配置自己的 TURN 服务器）
     this.iceServers = {
       iceServers: [
-        { urls: 'stun:stun.l.google.com:19302' }
+        // 测试模式：仅使用 TURN 服务器，禁用所有 STUN 服务器
+        // 用于验证 TURN 服务器是否能正常工作
+        // TODO: 测试完成后恢复 STUN 服务器配置
+        // 多个 STUN 服务器作为备用，提高容错性
+        // { urls: 'stun:stun.l.google.com:19302' },
+        // { urls: 'stun:stun1.l.google.com:19302' },
+        // { urls: 'stun:stun2.l.google.com:19302' },
+        // { urls: 'stun:stun3.l.google.com:19302' },
+        // { urls: 'stun:stun4.l.google.com:19302' },
+        // // 其他公共 STUN 服务器作为备用
+        // { urls: 'stun:stun.stunprotocol.org:3478' },
+        // TURN 服务器配置：用于跨网络/NAT 中继
+        // 注意：仅使用 UDP 传输，不使用 TCP
+        // 原因：机器人控制场景对延迟敏感，TCP 的重传机制会导致延迟不可预测
+        // UDP 即使丢包也比 TCP 重传导致的延迟要好（延迟比丢包更致命）
+        {
+          urls: 'turn:8.155.162.124:3478?transport=udp',
+          username: 'synria',
+          credential: 'xuanya666'
+        }
       ]
     };
   }
@@ -82,8 +104,42 @@ export class WebRTCManager {
   createPeerConnection() {
     this.pc = new RTCPeerConnection(this.iceServers);
 
+    // 监控 ICE 候选收集状态
+    this.pc.onicegatheringstatechange = () => {
+      console.log(`ICE gathering state: ${this.pc.iceGatheringState}`);
+    };
+
+    // 监控 ICE 连接状态变化（关键：监控直连失败和切换到 TURN）
+    this.pc.oniceconnectionstatechange = () => {
+      const state = this.pc.iceConnectionState;
+      console.log(`ICE connection state changed: ${state}`);
+      
+      // 记录连接类型（直连 vs TURN 中继）
+      this.logCurrentConnectionType();
+      
+      // 根据状态触发回调
+      if (state === 'connected' || state === 'completed') {
+        console.log("✅ WebRTC connection established");
+      } else if (state === 'failed' || state === 'disconnected') {
+        console.warn(`⚠️ WebRTC connection ${state}`);
+        // 注意：浏览器会自动重试，包括切换到 TURN
+      } else if (state === 'checking') {
+        console.log("🔄 ICE checking in progress...");
+      }
+    };
+
     this.pc.onicecandidate = (event) => {
       if (event.candidate) {
+        // 记录候选类型，便于调试
+        const candidateType = event.candidate.type || 'unknown';
+        const candidateStr = event.candidate.candidate || '';
+        
+        // 判断是否为 TURN relay 候选
+        const isRelay = candidateType === 'relay' || candidateStr.includes('relay');
+        const prefix = isRelay ? '🔄 [TURN]' : '📡 [直连]';
+        
+        console.log(`${prefix} ICE candidate gathered: ${candidateType}`, candidateStr.substring(0, 100));
+        
         this.sendSignalingMessage({
           type: 'ice-candidate',
           data: {
@@ -93,6 +149,10 @@ export class WebRTCManager {
           },
           target: this.targetId
         });
+      } else {
+        // candidate 为 null 表示 ICE gathering 完成
+        console.log("✅ ICE candidate gathering completed");
+        this.logCurrentConnectionType();
       }
     };
 
@@ -190,21 +250,53 @@ export class WebRTCManager {
   }
 
   async handleAnswer(msg) {
-    const answerDesc = new RTCSessionDescription({
-      type: 'answer',
-      sdp: msg.data.sdp
-    });
-    await this.pc.setRemoteDescription(answerDesc);
+    if (!this.pc) {
+      console.warn("PeerConnection not initialized, ignoring answer");
+      return;
+    }
+    
+    // 检查状态：只有在 have-local-offer 状态下才能设置 answer
+    // 防止重复处理或状态错误导致的异常
+    if (this.pc.signalingState !== "have-local-offer") {
+      console.warn(`Skip answer: unexpected signaling state ${this.pc.signalingState}`);
+      return;
+    }
+
+    try {
+      const answerDesc = new RTCSessionDescription({
+        type: 'answer',
+        sdp: msg.data.sdp
+      });
+      await this.pc.setRemoteDescription(answerDesc);
+      console.log("Successfully set remote answer");
+    } catch (error) {
+      console.error("Failed to set remote answer:", error);
+      // 不抛出异常，避免影响其他消息处理
+    }
   }
 
   async handleCandidate(msg) {
-    if (this.pc) {
+    if (!this.pc) {
+      console.warn("PeerConnection not initialized, ignoring ICE candidate");
+      return;
+    }
+
+    // 如果还没有设置 remote description，先缓存 candidate
+    // 注意：现代浏览器通常会自动处理这种情况，但显式检查更安全
+    if (this.pc.remoteDescription === null) {
+      console.warn("Remote description not set yet, candidate may be queued by browser");
+    }
+
+    try {
       const candidate = new RTCIceCandidate({
         candidate: msg.data.candidate,
         sdpMid: msg.data.sdpMid,
         sdpMLineIndex: msg.data.sdpMLineIndex
       });
       await this.pc.addIceCandidate(candidate);
+    } catch (error) {
+      console.error("Failed to add ICE candidate:", error);
+      // 不抛出异常，避免影响其他消息处理
     }
   }
 
@@ -251,5 +343,59 @@ export class WebRTCManager {
 
   setLocalStream(stream) {
     this.localStream = stream;
+  }
+
+  // 记录当前连接类型（直连 vs TURN 中继）
+  async logCurrentConnectionType() {
+    if (!this.pc) return;
+    
+    try {
+      const stats = await this.pc.getStats();
+      let hasRelay = false;
+      let hasHost = false;
+      let hasSrflx = false;
+      
+      stats.forEach((report) => {
+        if (report.type === 'local-candidate' || report.type === 'remote-candidate') {
+          const candidateType = report.candidateType;
+          if (candidateType === 'relay') {
+            hasRelay = true;
+          } else if (candidateType === 'host') {
+            hasHost = true;
+          } else if (candidateType === 'srflx') {
+            hasSrflx = true;
+          }
+        }
+        
+        // 检查选中的候选对
+        if (report.type === 'candidate-pair' && report.state === 'succeeded') {
+          const localCandidate = stats.get(report.localCandidateId);
+          const remoteCandidate = stats.get(report.remoteCandidateId);
+          
+          if (localCandidate?.candidateType === 'relay' || remoteCandidate?.candidateType === 'relay') {
+            hasRelay = true;
+            console.log("🔄 当前使用 TURN 中继连接（内网穿透失败，已切换到中继）");
+          } else if (localCandidate?.candidateType === 'srflx' || remoteCandidate?.candidateType === 'srflx') {
+            hasSrflx = true;
+            console.log("📡 当前使用 STUN 直连（NAT 穿透成功）");
+          } else if (localCandidate?.candidateType === 'host' || remoteCandidate?.candidateType === 'host') {
+            hasHost = true;
+            console.log("🏠 当前使用本地直连（同一网络）");
+          }
+        }
+      });
+      
+      // 汇总信息
+      const connectionTypes = [];
+      if (hasHost) connectionTypes.push('本地直连');
+      if (hasSrflx) connectionTypes.push('STUN穿透');
+      if (hasRelay) connectionTypes.push('TURN中继');
+      
+      if (connectionTypes.length > 0) {
+        console.log(`📊 连接类型: ${connectionTypes.join(' + ')}`);
+      }
+    } catch (error) {
+      console.warn("Failed to get connection stats:", error);
+    }
   }
 }
