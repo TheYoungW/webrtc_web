@@ -31,11 +31,16 @@
             {{ d.device_id }}（{{ d.driver_type }}）
           </option>
         </select>
+        <label style="margin-top: 0.75rem; display: block;">驱动类型</label>
+        <select v-model="selectedArmType" :disabled="isRobotBusy || robotConnected" style="width: 100%; padding: 0.8rem; margin-bottom: 0.75rem; border-radius: 12px; border: 1px solid rgba(0,0,0,0.1);">
+          <option value="alicia_d">alicia_d</option>
+          <option value="bessica_d">bessica_d</option>
+        </select>
         <div style="display:flex; gap: 12px;">
           <button class="full-width" @click="fetchRobotInfos" :disabled="isRobotBusy || robotConnected">
             刷新设备
           </button>
-          <button class="primary full-width" @click="connectRobot" :disabled="isRobotBusy || robotConnected || !selectedDeviceId || !selectedDriverType">
+          <button class="primary full-width" @click="connectRobot" :disabled="isRobotBusy || robotConnected || !selectedDeviceId || !selectedArmType">
             {{ robotConnected ? '已连接' : '连接机器人' }}
           </button>
         </div>
@@ -320,6 +325,7 @@ const WS_BASE = 'ws://127.0.0.1:8000';
 
 const robotDevices = ref([]); // [{ device_id, driver_type, ... }]
 const selectedDeviceId = ref('');
+const selectedArmType = ref('alicia_d'); // 手动选择的驱动类型
 const robotWsStatus = ref('未连接');
 const robotConnected = ref(false);
 const isRobotBusy = ref(false);
@@ -351,7 +357,7 @@ onMounted(async () => {
   };
 
   webrtc.onDataChannelMessage = (data) => {
-    // 操作臂：收到示教臂数据 -> 先打印 -> 再执行（转发给后端 /robots/ws/{device_id}）
+    // 操作臂：收到示教臂数据 -> 先打印 -> 再执行（转发给后端 /robots/bws/{device_id}）
     console.log("[webrtc] rx:", data);
     _recordRxFrame(data);
 
@@ -370,16 +376,32 @@ onMounted(async () => {
       const msg = JSON.parse(data);
 
       if (msg?.type === "state" && Array.isArray(msg?.joints_deg)) {
+        // 转换为 bws 接口的 cmd.movej 格式
+        // gripper_value 支持 float 或 [left, right]，优先使用 gripper_left/gripper_right
+        let gripperValue = msg.gripper ?? 0.0;
+        if (msg.gripper_left !== undefined && msg.gripper_right !== undefined) {
+          gripperValue = [msg.gripper_left, msg.gripper_right];
+        } else if (Array.isArray(msg.gripper)) {
+          gripperValue = msg.gripper;
+        }
+        
         out = JSON.stringify({
           type: "cmd.movej",
           joints_deg: msg.joints_deg,
-          gripper: msg.gripper ?? 0.0,
+          gripper_value: gripperValue,
           speed: msg.speed ?? 30.0,
           src: msg.src ?? "teaching_arm",
           ts: msg.ts ?? Date.now() / 1000,
         });
+      } else if (msg?.type === "cmd.movej") {
+        // 确保 cmd.movej 消息使用 gripper_value 字段（bws 接口优先）
+        if (msg.gripper !== undefined && msg.gripper_value === undefined) {
+          msg.gripper_value = msg.gripper;
+          delete msg.gripper;
+        }
+        out = JSON.stringify(msg);
       } else {
-        // 保持原样（cmd.* / ingest / ping 等）
+        // 保持原样（其他消息类型）
         out = JSON.stringify(msg);
       }
     } catch {
@@ -442,6 +464,11 @@ const fetchRobotInfos = async () => {
     robotDevices.value = Array.isArray(list) ? list : [];
     if (!selectedDeviceId.value && robotDevices.value.length > 0) {
       selectedDeviceId.value = robotDevices.value[0].device_id;
+      // 自动设置驱动类型为设备的 driver_type（如果匹配）
+      const autoType = robotDevices.value[0].driver_type;
+      if (autoType === 'alicia_d' || autoType === 'bessica_d') {
+        selectedArmType.value = autoType;
+      }
     }
     // 自动设置设备 ID 为第一个设备的 serial_number
     if (!deviceId.value && robotDevices.value.length > 0 && robotDevices.value[0].serial_number) {
@@ -461,7 +488,7 @@ const fetchRobotInfos = async () => {
 };
 
 const connectRobot = async () => {
-  if (!selectedDeviceId.value || !selectedDriverType.value) return;
+  if (!selectedDeviceId.value || !selectedArmType.value) return;
   isRobotBusy.value = true;
   robotWsStatus.value = '连接中...';
   try {
@@ -469,7 +496,7 @@ const connectRobot = async () => {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        arm_type: selectedDriverType.value,
+        arm_type: selectedArmType.value,
         device_id: selectedDeviceId.value,
       })
     });
@@ -496,13 +523,13 @@ const connectRobotWs = async (devicePath) => {
   stopCmdConsumer();
 
   // 注意：device_id 类似 "/dev/cu.xxx"，拼接后会出现双斜杠，符合后端 {device_id:path} 的用法
-  const wsUrl = `${WS_BASE}/robots/ws/${devicePath}`;
+  // 使用简化版 bws 接口：连接后自动发送 hello，无需 ping
+  const wsUrl = `${WS_BASE}/robots/bws/${devicePath}`;
   robotWs = new WebSocket(wsUrl);
 
   robotWs.onopen = () => {
-    // 按要求：先发 ping，等 hello
-    robotWsStatus.value = '握手中...';
-    robotWs.send(JSON.stringify({ type: 'ping' }));
+    // bws 接口连接后会自动发送 hello，无需手动 ping
+    robotWsStatus.value = '连接中...';
     
     // NEW: 连接建立，开始启动指令消费循环
     startCmdConsumer();

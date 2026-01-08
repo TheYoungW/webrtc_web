@@ -45,12 +45,15 @@
         </div>
         <div class="input-group">
           <label>驱动类型</label>
-          <input :value="selectedDriverType || '-'" disabled />
+          <select v-model="selectedArmType" :disabled="isRobotBusy || robotConnected">
+            <option value="alicia_d">alicia_d</option>
+            <option value="bessica_d">bessica_d</option>
+          </select>
         </div>
         <button @click="fetchRobotInfos" :disabled="isRobotBusy || robotConnected">
           刷新设备
         </button>
-        <button class="primary" @click="connectRobot" :disabled="isRobotBusy || robotConnected || !selectedDeviceId || !selectedDriverType">
+        <button class="primary" @click="connectRobot" :disabled="isRobotBusy || robotConnected || !selectedDeviceId || !selectedArmType">
           {{ robotConnected ? '已连接' : '连接机器人' }}
         </button>
       </div>
@@ -178,6 +181,7 @@ const WS_BASE = 'ws://127.0.0.1:8000';
 
 const robotDevices = ref([]); // [{ device_id, driver_type, ... }]
 const selectedDeviceId = ref('');
+const selectedArmType = ref('alicia_d'); // 手动选择的驱动类型
 const robotWsStatus = ref('未连接');
 const robotConnected = ref(false);
 const robotLastState = ref(null);
@@ -260,6 +264,11 @@ const fetchRobotInfos = async () => {
     robotDevices.value = Array.isArray(list) ? list : [];
     if (!selectedDeviceId.value && robotDevices.value.length > 0) {
       selectedDeviceId.value = robotDevices.value[0].device_id;
+      // 自动设置驱动类型为设备的 driver_type（如果匹配）
+      const autoType = robotDevices.value[0].driver_type;
+      if (autoType === 'alicia_d' || autoType === 'bessica_d') {
+        selectedArmType.value = autoType;
+      }
     }
     // 自动设置本机 ID 为第一个设备的 serial_number
     if (!deviceId.value && robotDevices.value.length > 0 && robotDevices.value[0].serial_number) {
@@ -279,7 +288,7 @@ const fetchRobotInfos = async () => {
 };
 
 const connectRobot = async () => {
-  if (!selectedDeviceId.value || !selectedDriverType.value) return;
+  if (!selectedDeviceId.value || !selectedArmType.value) return;
   isRobotBusy.value = true;
   robotWsStatus.value = '连接中...';
   try {
@@ -287,7 +296,7 @@ const connectRobot = async () => {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        arm_type: selectedDriverType.value,
+        arm_type: selectedArmType.value,
         device_id: selectedDeviceId.value,
       })
     });
@@ -322,13 +331,13 @@ const connectRobotWsAndStartStateLoop = async (devicePath) => {
   }
 
   // 注意：device_id 类似 "/dev/cu.xxx"，拼接后会出现双斜杠，符合后端 {device_id:path} 的用法
-  const wsUrl = `${WS_BASE}/robots/ws/${devicePath}`;
+  // 使用简化版 bws 接口：连接后自动发送 hello，无需 ping
+  const wsUrl = `${WS_BASE}/robots/bws/${devicePath}`;
   robotWs = new WebSocket(wsUrl);
 
   robotWs.onopen = () => {
-    // 按你的要求：先发 ping
-    robotWsStatus.value = '握手中...';
-    robotWs.send(JSON.stringify({ type: 'ping' }));
+    // bws 接口连接后会自动发送 hello，无需手动 ping
+    robotWsStatus.value = '连接中...';
   };
 
   robotWs.onerror = (err) => {
@@ -364,12 +373,20 @@ const connectRobotWsAndStartStateLoop = async (devicePath) => {
         robotLastState.value = msg;
 
         // 示教臂：把读取到的关节状态通过 WebRTC DataChannel 转发给操作臂，让对方“打印并执行”
-        // 这里将 state 直接封装成后端 ws.py 支持的 cmd.movej 格式
+        // 这里将 state 转换为 bws 接口支持的 cmd.movej 格式
         if (webrtc && isDataChannelOpen.value && msg?.joints_deg) {
+          // gripper_value 支持 float 或 [left, right]，优先使用 gripper_left/gripper_right
+          let gripperValue = msg.gripper ?? 0.0;
+          if (msg.gripper_left !== undefined && msg.gripper_right !== undefined) {
+            gripperValue = [msg.gripper_left, msg.gripper_right];
+          } else if (Array.isArray(msg.gripper)) {
+            gripperValue = msg.gripper;
+          }
+          
           const payload = {
             type: 'cmd.movej',
             joints_deg: msg.joints_deg,
-            gripper: msg.gripper ?? 0.0,
+            gripper_value: gripperValue,
             speed: 350,
             src: 'teaching_arm',
             ts: msg.ts ?? Date.now() / 1000,
