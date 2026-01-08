@@ -377,12 +377,17 @@ onMounted(async () => {
 
       if (msg?.type === "state" && Array.isArray(msg?.joints_deg)) {
         // 转换为 bws 接口的 cmd.movej 格式
-        // gripper_value 支持 float 或 [left, right]，优先使用 gripper_left/gripper_right
-        let gripperValue = msg.gripper ?? 0.0;
+        // gripper_value 优先使用 gripper_left/gripper_right（双臂），否则使用 gripper（单臂）
+        let gripperValue;
         if (msg.gripper_left !== undefined && msg.gripper_right !== undefined) {
+          // 双臂：使用左右夹爪值
           gripperValue = [msg.gripper_left, msg.gripper_right];
         } else if (Array.isArray(msg.gripper)) {
+          // 如果 gripper 本身就是数组
           gripperValue = msg.gripper;
+        } else {
+          // 单臂：使用单个 gripper 值
+          gripperValue = msg.gripper ?? 0.0;
         }
         
         out = JSON.stringify({
