@@ -24,17 +24,14 @@ export class WebRTCManager {
     // TURN: 用于中继，当直连失败时使用（需要配置自己的 TURN 服务器）
     this.iceServers = {
       iceServers: [
-        // 测试模式：仅使用 TURN 服务器，禁用所有 STUN 服务器
-        // 用于验证 TURN 服务器是否能正常工作
-        // TODO: 测试完成后恢复 STUN 服务器配置
         // 多个 STUN 服务器作为备用，提高容错性
-        // { urls: 'stun:stun.l.google.com:19302' },
-        // { urls: 'stun:stun1.l.google.com:19302' },
-        // { urls: 'stun:stun2.l.google.com:19302' },
-        // { urls: 'stun:stun3.l.google.com:19302' },
-        // { urls: 'stun:stun4.l.google.com:19302' },
-        // // 其他公共 STUN 服务器作为备用
-        // { urls: 'stun:stun.stunprotocol.org:3478' },
+        { urls: 'stun:stun.l.google.com:19302' },
+        { urls: 'stun:stun1.l.google.com:19302' },
+        { urls: 'stun:stun2.l.google.com:19302' },
+        { urls: 'stun:stun3.l.google.com:19302' },
+        { urls: 'stun:stun4.l.google.com:19302' },
+        // 其他公共 STUN 服务器作为备用
+        { urls: 'stun:stun.stunprotocol.org:3478' },
         // TURN 服务器配置：用于跨网络/NAT 中继
         // 注意：仅使用 UDP 传输，不使用 TCP
         // 原因：机器人控制场景对延迟敏感，TCP 的重传机制会导致延迟不可预测
@@ -44,8 +41,7 @@ export class WebRTCManager {
           username: 'synria',
           credential: 'xuanya666'
         }
-      ],
-      iceTransportPolicy: 'relay'
+      ]
     };
   }
 
